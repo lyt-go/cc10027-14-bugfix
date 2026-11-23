@@ -77,5 +77,20 @@ npm run dev
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
 
+## 批量事件逐项受理
+
+`POST /api/event-batches` 按位置配对 `event_codes` 和 `payloads`（允许不等长）：
+
+- 每个位置都有一条受理明细，状态为 `accepted`（已落盘）或
+  `missing_payload` / `missing_event_code` / `rejected` / `error` 等待补项；
+- 同一事件编号出现在多个位置时各算一次真实上报，不做同号合并；
+- 调用方超时重送时带原 `submission_id`，已受理位置只确认、不再入库，
+  只继续处理未完成项；
+- 受理明细落盘在 `data/events/submissions/`，可随时用
+  `GET /api/event-batches/{submission_id}` 追查；
+- `GET /api/events/{event_code}/stats` 给出实际入库次数和可追查的缺项。
+
+`interrupt_after` 参数仅用于演练“写入若干项后响应中断”，便于验证重送行为。
+
 领域：数据工程
 子方向：数据采集、爬虫与RPA

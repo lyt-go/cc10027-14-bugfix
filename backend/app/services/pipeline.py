@@ -89,36 +89,78 @@ class CrossModulePipeline:
         results["sources_processed"] = len(active_sources)
         return results
 
-    def event_tracking_pipeline(self, event_codes: list[str], payloads: list[dict[str, Any]] | None = None) -> dict[str, Any]:
-        """事件追踪管道：跟踪 -> 校验 -> 缓冲刷新。"""
+    def event_tracking_pipeline(
+        self,
+        event_codes: list[str],
+        payloads: list[dict[str, Any] | None] | None = None,
+        submission_id: str | None = None,
+        *,
+        interrupt_after: int | None = None,
+    ) -> dict[str, Any]:
+        """事件追踪管道：逐项受理 -> 缓冲刷新 -> 校验。
+
+        受理交给 ``EventTrackerService.submit_batch``，按位置生成受理明细；
+        编号和载荷数量不一致时不会整段丢掉尾部，重复编号也按各自位置分别入库。
+        重送同一个 ``submission_id`` 时只处理未完成位置，不会重复写事件数据或缓冲。
+        """
         started_at = time.time()
-        results = {"pipeline": "event_tracking", "stages": {}}
+        results: dict[str, Any] = {"pipeline": "event_tracking", "stages": {}}
 
+        submitted_payloads: list[dict[str, Any] | None] | None
         if payloads is None:
-            payloads = [{"page_view": "home", "user_action": "click"} for _ in event_codes]
+            submitted_payloads = [
+                {"page_view": "home", "user_action": "click"} for _ in event_codes
+            ]
+        else:
+            submitted_payloads = list(payloads)
 
-        for event_code, payload in zip(event_codes, payloads):
-            event_results = {}
+        receipt = self.event_tracker.submit_batch(
+            event_codes,
+            submitted_payloads,
+            submission_id,
+            interrupt_after=interrupt_after,
+        )
+        results["submission_id"] = receipt["submission_id"]
+        results["receipt"] = receipt
 
-            # 阶段1: 事件跟踪
-            track_r = self.event_tracker.track_event(event_code, payload)
-            event_results["track"] = track_r
+        # 只缓冲本次真正新落盘的位置：重送时已受理项不会再次入缓冲。
+        newly_stored = [
+            item for item in receipt.get("items", [])
+            if item.get("last_action") == "stored"
+        ]
+        buffered = {}
+        for item in newly_stored:
+            buffer_r = self.stream_buffer.buffer_event(
+                item["event_code"],
+                {
+                    "event_data": item.get("payload"),
+                    "record_id": item.get("record_id"),
+                    "submission_id": receipt["submission_id"],
+                    "item_index": item.get("index"),
+                },
+            )
+            buffered[item["index"]] = buffer_r
 
-            # 阶段2: 流式缓冲
-            buffer_r = self.stream_buffer.buffer_event(event_code, {"event_data": payload, "tracked": track_r})
-            event_results["buffer"] = buffer_r
+        flush_r = self.stream_buffer.flush_all()
 
-            # 阶段3: 事件校验
-            validate_r = self.event_validate.validate_event_data(event_code)
-            event_results["validate"] = validate_r
+        # 按输入位置记录阶段结果；同一事件编号的多次浏览不会互相覆盖。
+        for item in receipt.get("items", []):
+            index = item.get("index")
+            results["stages"][f"item-{index}"] = {
+                "index": index,
+                "event_code": item.get("event_code"),
+                "state": item.get("state"),
+                "stored": bool(item.get("stored")),
+                "reason": item.get("last_reason"),
+                "buffer": buffered.get(index),
+            }
 
-            results["stages"][event_code] = event_results
-
-        # 确保缓冲刷写
-        self.stream_buffer.flush_all()
-
+        results["buffer_flush"] = flush_r
         results["duration"] = round(time.time() - started_at, 2)
-        results["events_processed"] = len(event_codes)
+        results["events_submitted"] = max(len(event_codes), len(submitted_payloads))
+        results["events_processed"] = results["events_submitted"]
+        results["events_stored"] = receipt.get("summary", {}).get("stored", 0)
+        results["events_pending"] = receipt.get("summary", {}).get("pending", 0)
         return results
 
     def backfill_pipeline(self, source_key: str, time_range: str) -> dict[str, Any]:

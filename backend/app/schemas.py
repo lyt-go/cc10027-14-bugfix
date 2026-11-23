@@ -29,3 +29,13 @@ class EntryPayload(BaseModel):
 class ActionPayload(BaseModel):
     action: str
     remark: str | None = None
+
+
+class EventBatchPayload(BaseModel):
+    """批量事件上报：编号与载荷按位置配对，允许不等长。"""
+
+    submission_id: str | None = None
+    event_codes: list[str | None] = Field(default_factory=list)
+    payloads: list[dict[str, Any] | None] | None = None
+    # 仅用于演练“写入若干项后响应中断”，便于验证原凭据重送的行为。
+    interrupt_after: int | None = None
